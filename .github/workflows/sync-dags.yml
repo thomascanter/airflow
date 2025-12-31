@@ -1,0 +1,87 @@
+name: Sync DAGs
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      target_dir:
+        description: 'Target directory to sync into (on self-hosted runner)'
+        required: false
+        default: '/mnt/docker_storage/airflow/dags'
+      commit:
+        description: 'Commit and push changes back to repo (true/false). Skipped if target is outside repo.'
+        required: false
+        default: 'false'
+
+jobs:
+  sync:
+    runs-on: [self-hosted, Linux, X64, airflow-dags]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Sync DAGs (copy newer files)
+        env:
+          SRC: dags
+          TARGET_DIR_INPUT: ${{ github.event.inputs.target_dir }}
+          COMMIT_INPUT: ${{ github.event.inputs.commit }}
+        run: |
+          set -euo pipefail
+          TARGET_DIR="${TARGET_DIR_INPUT:-/mnt/docker_storage/airflow/dags}"
+          echo "Workspace: $GITHUB_WORKSPACE"
+          SRC_REAL=$(realpath "$GITHUB_WORKSPACE/$SRC")
+          TARGET_REAL=$(realpath -m "$TARGET_DIR")
+          echo "Source (real): $SRC_REAL"
+          echo "Target (real): $TARGET_REAL"
+          mkdir -p "$TARGET_REAL"
+          find "$SRC_REAL" -type f | while IFS= read -r srcfile; do
+            rel="${srcfile#${SRC_REAL}/}"
+            dst="$TARGET_REAL/$rel"
+            mkdir -p "$(dirname "$dst")"
+            if [ -f "$dst" ]; then
+              src_mtime=$(stat -c %Y "$srcfile")
+              dst_mtime=$(stat -c %Y "$dst")
+              if [ "$src_mtime" -gt "$dst_mtime" ]; then
+                cp -a "$srcfile" "$dst"
+                echo "Copied newer: $rel"
+              else
+                echo "Skipped (not newer): $rel"
+              fi
+            else
+              cp -a "$srcfile" "$dst"
+              echo "Copied new file: $rel"
+            fi
+          done
+
+      - name: Commit and push changes
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.commit == 'true' }}
+        env:
+          TARGET_DIR_INPUT: ${{ github.event.inputs.target_dir }}
+          SRC: dags
+        run: |
+          set -euo pipefail
+          TARGET_DIR="${TARGET_DIR_INPUT:-/mnt/docker_storage/airflow/dags}"
+          echo "Checking whether target is inside workspace before attempting git operations"
+          GWD=$(realpath "$GITHUB_WORKSPACE")
+          TARGET_REAL=$(realpath -m "$TARGET_DIR")
+          if [ "$GWD" = "" ] || [ "$TARGET_REAL" = "" ]; then
+            echo "Unable to determine realpath for workspace or target. Skipping commit."
+            exit 0
+          fi
+          case "$TARGET_REAL" in
+            "$GWD"|"$GWD"/*)
+              echo "Target is inside workspace: $TARGET_REAL" ;;
+            *)
+              echo "Target ($TARGET_REAL) is outside workspace ($GWD). Skipping git commit/push." ; exit 0 ;;
+          esac
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$TARGET_REAL"
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Sync DAGs from $SRC to $TARGET_DIR"
+            git push
+          fi
