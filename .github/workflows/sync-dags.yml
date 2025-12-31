@@ -55,6 +55,17 @@ jobs:
             fi
           done
 
+          # Copy docker-compose.yaml from repo to the target parent (if present)
+          DOCKER_SRC="$GITHUB_WORKSPACE/docker/docker-compose.yaml"
+          TARGET_PARENT="$(dirname "$TARGET_REAL")"
+          if [ -f "$DOCKER_SRC" ]; then
+            mkdir -p "$TARGET_PARENT"
+            cp -a "$DOCKER_SRC" "$TARGET_PARENT/docker-compose.yaml"
+            echo "Copied docker-compose.yaml to $TARGET_PARENT/docker-compose.yaml"
+          else
+            echo "No docker-compose.yaml found at $DOCKER_SRC"
+          fi
+
       - name: Commit and push changes
         if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.commit == 'true' }}
         env:
