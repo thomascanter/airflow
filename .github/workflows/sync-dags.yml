@@ -56,12 +56,11 @@ jobs:
           done
 
           # Copy docker-compose.yaml from repo to the target parent (if present)
-          DOCKER_SRC="$GITHUB_WORKSPACE/docker/docker-compose.yaml"
+          DOCKER_SRC="$GITHUB_WORKSPACE/docker/*"
           TARGET_PARENT="$(dirname "$TARGET_REAL")"
           if [ -f "$DOCKER_SRC" ]; then
             mkdir -p "$TARGET_PARENT"
-            cp -a "$DOCKER_SRC" "$TARGET_PARENT/docker-compose.yaml"
-            echo "Copied docker-compose.yaml to $TARGET_PARENT/docker-compose.yaml"
+            cp -a "$DOCKER_SRC" "$TARGET_PARENT/"
           else
             echo "No docker-compose.yaml found at $DOCKER_SRC"
           fi
