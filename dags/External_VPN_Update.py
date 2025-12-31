@@ -2,19 +2,19 @@ import requests
 import boto3
 import os  # add import
 from airflow import DAG
-from airflow.providers.standard.operators.python import PythonOperator
+from airflow.operators.python import PythonOperator
 from datetime import datetime, timedelta
-from airflow.sdk.bases.hook import BaseHook  # add import
+from airflow.hooks.base import BaseHook
 
 
-def get_public_ip(**context):
+def get_public_ip():
     response = requests.get('https://api.ipify.org?format=json', timeout=10)
     response.raise_for_status()
     ip = response.json()['ip']
-    context['ti'].xcom_push(key='public_ip', value=ip)
+    return ip
 
 def update_route53_dns(**context):
-    ip = context['ti'].xcom_pull(key='public_ip', task_ids='get_public_ip')
+    ip = context['ti'].xcom_pull(task_ids='get_public_ip')
     hosted_zone_id = 'Z072222327445DTYH7COP'
     record_name = 'gateway.dragon-den.com.'
     record_type = 'A'
@@ -53,12 +53,12 @@ def update_route53_dns(**context):
             resource_records = record_sets[0].get('ResourceRecords', [])
             if resource_records:
                 current_ip = resource_records[0]['Value']
-        print(f"Generating file ({ip_file}) with IP ({ip})")    
+        print(f"Generating file ({ip_file}) with IP ({current_ip})")
         with open(ip_file, 'w') as f:
             f.write(current_ip if current_ip else '')
         previous_ip = current_ip
     else:
-        print(f"File  Esists ({ip_file}) with retrieving stored IP") 
+        print(f"File exists ({ip_file}) - retrieving stored IP")
         with open(ip_file, 'r') as f:
             previous_ip = f.read().strip()
 
