@@ -344,5 +344,5 @@ volumes:
     driver: local
     driver_opts:
       type: none
-      device: ${postgres-db-volume}
+      device: ${AIRFLOW_PROJ_DIR:-.}/db
       o: bind
