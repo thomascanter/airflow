@@ -57,9 +57,9 @@ x-airflow-common:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: CeleryExecutor
     AIRFLOW__CORE__AUTH_MANAGER: airflow.providers.fab.auth_manager.fab_auth_manager.FabAuthManager
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflowdb_usr:airflowdb_usr@truenas.dragon-den.net/airflow
-    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflowdb_usr:airflowdb_usr@truenas.dragon-den.net/airflow
-    AIRFLOW__CELERY__BROKER_URL: redis://:@redis:6379/0
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: ${AIRFLOW__DATABASE__SQL_ALCHEMY_CONN:-postgresql+psycopg2://airflowdb_usr:airflowdb_usr@truenas.dragon-den.net/airflow}
+    AIRFLOW__CELERY__RESULT_BACKEND: ${AIRFLOW__CELERY__RESULT_BACKEND:-db+postgresql://airflowdb_usr:airflowdb_usr@truenas.dragon-den.net/airflow}
+    AIRFLOW__CELERY__BROKER_URL: ${AIRFLOW__CELERY__BROKER_URL:-redis://:@redis:6379/0}
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'true'
@@ -88,20 +88,22 @@ x-airflow-common:
     #  condition: service_healthy
 
 services:
-  #postgres:
-  #  image: postgres:16
-  #  environment:
-  #    POSTGRES_USER: airflow
-  #    POSTGRES_PASSWORD: airflow
-  #    POSTGRES_DB: airflow
-  #  volumes:
-  #    - postgres-db-volume:/var/lib/postgresql/data
-  #  healthcheck:
-  #    test: ["CMD", "pg_isready", "-U", "airflow"]
-  #    interval: 10s
-  #    retries: 5
-  #    start_period: 5s
-  #  restart: always
+  postgres:
+    profiles:
+      - local
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
 
   redis:
     # Redis is limited to 7.2-bookworm due to licencing change
@@ -166,6 +168,9 @@ services:
 
   airflow-worker:
     <<: *airflow-common
+    build:
+      context: .
+      dockerfile: Dockerfile.airflow-worker
     command: celery worker
     healthcheck:
       # yamllint disable rule:line-length
@@ -181,6 +186,7 @@ services:
       # Required to handle warm shutdown of the celery workers properly
       # See https://airflow.apache.org/docs/docker-stack/entrypoint.html#signal-propagation
       DUMB_INIT_SETSID: "0"
+      _PIP_ADDITIONAL_REQUIREMENTS: "${_PIP_ADDITIONAL_REQUIREMENTS:-} pydub"
     restart: always
     depends_on:
       <<: *airflow-common-depends-on
@@ -333,5 +339,10 @@ services:
       airflow-init:
         condition: service_completed_successfully
 
-#volumes:
-  #postgres-db-volume:
+volumes:
+  postgres-db-volume:
+    driver: local
+    driver_opts:
+      type: none
+      device: ${postgres-db-volume}
+      o: bind
