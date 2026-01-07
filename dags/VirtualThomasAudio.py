@@ -12,8 +12,52 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from airflow.sdk import Variable
-import io
-from pydub import AudioSegment
+
+import tempfile
+import subprocess
+import time
+import re
+
+
+def combine_audio_parts(parts: list, output_path: Optional[str] = None, bitrate: str = '192k') -> str:
+    """Concatenate audio files in `parts` (in order) into a single MP3 using ffmpeg.
+
+    Returns the path to the combined MP3 file. Raises subprocess.CalledProcessError on failure.
+    This function will create a temporary concat list file next to the first part and
+    will remove the list file and the individual part files after combining. The
+    combined output file is left in place for the caller to upload or remove.
+    """
+    if not parts:
+        raise ValueError('No parts to combine')
+
+    tmpdir = os.path.dirname(parts[0])
+    if output_path is None:
+        output_path = os.path.join(tmpdir, 'combined.mp3')
+
+    list_path = os.path.join(tmpdir, 'parts.txt')
+    with open(list_path, 'w', encoding='utf-8') as lf:
+        for p in parts:
+            # escape single quotes for ffmpeg concat file
+            safe = p.replace("'", "'\\''")
+            lf.write(f"file '{safe}'\n")
+
+    cmd = [
+        'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
+        '-c:a', 'libmp3lame', '-b:a', bitrate, output_path
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+    # remove parts and list file, keep output
+    try:
+        for p in parts:
+            if os.path.exists(p):
+                os.remove(p)
+        if os.path.exists(list_path):
+            os.remove(list_path)
+    except Exception:
+        log.warning('Failed to remove temporary part files in %s', tmpdir)
+
+    return output_path
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +72,7 @@ def _extract_text_from_conf() -> str:
     return text
 
 
-def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 300) -> str:
+def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 600) -> str:
     context = get_current_context()
     text = _extract_text_from_conf()
     conf = (context.get('dag_run') or {}).conf or {}
@@ -81,7 +125,7 @@ def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 300
     return str(data)
 
 
-def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[str] = None, timeout: int = 120) -> dict:
+def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[str] = None, timeout: int = 600) -> dict:
     """Synthesize text in chunks and return base64-encoded MP3 bytes and filename.
 
     Returns a dict compatible with XCom JSON serialization: {'mp3_b64': str, 'filename': str}
@@ -100,24 +144,41 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
     chatterbox_url = Variable.get('chatterbox_url') or ''
     voice = voice or conf.get('voice') or 'default'
 
-    # chunking
+    # chunking: prefer paragraph breaks or sentence endings (period) before max_chars
     max_chars = int(conf.get('chunk_size', 3000))
     chunks = []
     text = generated_text.strip()
+    sentence_re = re.compile(r'[\.\!\?](?:\s|$)')
     while text:
         if len(text) <= max_chars:
             chunks.append(text)
             break
-        split_at = text.rfind(' ', 0, max_chars)
-        if split_at <= 0:
-            split_at = max_chars
+
+        window = text[:max_chars]
+
+        # 1) prefer paragraph break (double newline)
+        para_idx = window.rfind('\n\n')
+        if para_idx > 0:
+            split_at = para_idx + 2
+        else:
+            # 2) prefer last sentence-ending punctuation within window
+            matches = list(sentence_re.finditer(window))
+            if matches:
+                split_at = matches[-1].end()
+            else:
+                # 3) fallback to last space
+                split_at = window.rfind(' ')
+                if split_at <= 0:
+                    # 4) last resort: hard split at max_chars
+                    split_at = max_chars
+
         chunks.append(text[:split_at].strip())
         text = text[split_at:].strip()
 
     if not chunks:
         raise ValueError('No text chunks to synthesize')
 
-    segments = []
+    parts = []
     for idx, chunk in enumerate(chunks):
         log.info('Synthesizing chunk %d/%d (chars=%d)', idx + 1, len(chunks), len(chunk))
         payload = {'input': chunk, 'voice': voice}
@@ -130,13 +191,64 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
 
         try:
             log.info('Requesting TTS from Chatterbox at %s', chatterbox_url)
+            resp = requests.post(f"{chatterbox_url.rstrip('/')}/audio/speech", json=payload, timeout=timeout)
 
-            resp = requests.post(chatterbox_url, json=payload, timeout=timeout)
-            resp.raise_for_status()
+            # handle sync (200/201) or async accepted (202 -> poll)
+            if resp.status_code in (200, 201):
+                resp.raise_for_status()
+                final_resp = resp
+            elif resp.status_code == 202:
+                # determine status URL from Location header or response JSON
+                status_url = resp.headers.get('Location')
+                try:
+                    j = resp.json()
+                except Exception:
+                    j = {}
+                if not status_url:
+                    status_url = j.get('status_url') or (f"{chatterbox_url.rstrip('/')}/audio/status/{j.get('job_id')}" if j.get('job_id') else None)
+                if not status_url:
+                    raise RuntimeError('Chatterbox accepted request but did not return a status URL')
+
+                max_wait = int(conf.get('poll_max_wait', 300))
+                poll_interval = int(conf.get('poll_interval', 2))
+                elapsed = 0
+                final_resp = None
+                while elapsed < max_wait:
+                    time.sleep(poll_interval)
+                    elapsed += poll_interval
+                    s = requests.get(status_url, timeout=timeout)
+                    if s.status_code == 200:
+                        ct = s.headers.get('Content-Type', '')
+                        if ct.startswith('audio/'):
+                            final_resp = s
+                            break
+                        try:
+                            sdata = s.json()
+                        except Exception:
+                            sdata = None
+                        if sdata:
+                            if sdata.get('status') in ('completed', 'success') and any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')):
+                                final_resp = s
+                                break
+                            if sdata.get('status') in ('failed', 'error'):
+                                raise RuntimeError(f"Chatterbox job failed: {sdata}")
+                        continue
+                    elif s.status_code == 202:
+                        continue
+                    else:
+                        s.raise_for_status()
+
+                if final_resp is None:
+                    raise RuntimeError('Timed out waiting for Chatterbox job to complete')
+            else:
+                resp.raise_for_status()
+                final_resp = resp
         except requests.RequestException as exc:
             log.exception('Chatterbox request failed for chunk %d: %s', idx + 1, exc)
             raise
 
+        # use final_resp (could be immediate or polled result)
+        resp = final_resp
         content_type = resp.headers.get('Content-Type', '')
         audio_bytes = None
         if content_type.startswith('audio/'):
@@ -178,39 +290,78 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
             subtype = content_type.split('/', 1)[1].split(';', 1)[0]
             if subtype in ('mpeg', 'mp3'):
                 fmt = 'mp3'
-            elif 'wav' in subtype:
-                fmt = 'wav'
             else:
                 fmt = subtype
         else:
-            fmt = conf.get('expected_audio_format') or 'wav'
+            fmt = conf.get('expected_audio_format') or 'mp3'
 
-        try:
-            seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format=fmt)
-        except Exception:
-            try:
-                seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format='wav')
-            except Exception:
-                seg = AudioSegment.from_file(io.BytesIO(audio_bytes), format='mp3')
+        # write chunk to temp file for ffmpeg concat
+        # choose extension from content type
+        if content_type.startswith('audio/'):
+            if 'mpeg' in content_type or 'mp3' in content_type:
+                ext = 'mp3'
+            else:
+                ext = 'bin'
+        else:
+            # prefer mp3 by default for processed audio
+            ext = conf.get('expected_audio_format') or 'mp3'
 
-        segments.append(seg)
+        tmpdir = None
+        # create tmpdir once
+        if not parts:
+            tmpdir = tempfile.mkdtemp(prefix='virtual_thomas_')
+        else:
+            # reuse existing tmpdir from first part
+            tmpdir = os.path.dirname(parts[0])
 
-    if not segments:
+        part_path = os.path.join(tmpdir, f'chunk_{idx+1}.{ext}')
+        with open(part_path, 'wb') as fh:
+            fh.write(audio_bytes)
+        parts.append(part_path)
+
+    if not parts:
         raise RuntimeError('No audio segments produced')
 
-    combined = segments[0]
-    for s in segments[1:]:
-        combined += s
+    # create ffmpeg concat list file
+    list_path = os.path.join(tmpdir, 'parts.txt')
+    with open(list_path, 'w', encoding='utf-8') as lf:
+        for p in parts:
+            lf.write(f"file '{p.replace("'", "'\\'\"")}'\n")
 
-    out_buf = io.BytesIO()
-    combined.export(out_buf, format='mp3')
-    out_buf.seek(0)
-    final_bytes = out_buf.read()
+    output_path = os.path.join(tmpdir, 'combined.mp3')
+    # use ffmpeg to concat and encode to mp3
+    try:
+        log.info('Combining %d audio parts into final MP3 at %s', len(parts), output_path)
+        cmd = [
+            'ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', list_path,
+            '-c:a', 'libmp3lame', '-b:a', '192k', output_path
+        ]
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with open(output_path, 'rb') as fh:
+            final_bytes = fh.read()
+    finally:
+        # cleanup temp parts and list; ignore errors
+        try:
+            for p in parts:
+                if os.path.exists(p):
+                    os.remove(p)
+            if os.path.exists(list_path):
+                os.remove(list_path)
+            if os.path.exists(output_path):
+                # keep combined until uploaded; we'll remove after upload in upload_to_minio
+                pass
+        except Exception:
+            log.warning('Failed to clean up temp files in %s', tmpdir)
 
     timestamp = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
     filename = conf.get('filename') or f'virtual_thomas_{timestamp}.mp3'
 
-    return {'mp3_b64': base64.b64encode(final_bytes).decode('ascii'), 'filename': filename}
+    # Return both the base64 (fallback) and the local path to the combined file so
+    # downstream tasks can upload the file directly without storing large XComs.
+    return {
+        'filename': filename,
+        'combined_path': output_path,
+    }
 
 
 def upload_to_minio(*, timeout: int = 60) -> str:
@@ -224,12 +375,18 @@ def upload_to_minio(*, timeout: int = 60) -> str:
     if not payload or not isinstance(payload, dict):
         raise ValueError('Missing XCom payload from synthesize_chunks')
 
-    mp3_b64 = payload.get('mp3_b64')
     filename = payload.get('filename')
-    if not mp3_b64 or not filename:
-        raise ValueError('synthesize_chunks did not return mp3_b64 and filename')
+    combined_path = payload.get('combined_path')
 
-    final_bytes = base64.b64decode(mp3_b64)
+    final_bytes = None
+    # Prefer uploading the combined MP3 file produced in the temp directory
+    if combined_path and os.path.exists(combined_path):
+        log.info('Found combined file from synthesize_chunks at %s; uploading file directly', combined_path)
+        with open(combined_path, 'rb') as fh:
+            final_bytes = fh.read()
+        # If filename missing, infer from path
+        if not filename:
+            filename = os.path.basename(combined_path)
 
     minio_bucket = Variable.get('minio_bucket') or ''
     minio_access_key_id = Variable.get('minio_username') or ''
@@ -243,12 +400,22 @@ def upload_to_minio(*, timeout: int = 60) -> str:
 
     key = f"{filename}"
 
+    # Normalize and trim credentials to avoid stray whitespace issues
+    minio_endpoint = (minio_endpoint or '').rstrip('/')
+    access_key = minio_access_key_id.strip()
+    secret_key = minio_secret_access_key.strip()
+
+    # Masked logging for debugging (do not log secret)
+    log.info('Using MinIO endpoint=%s access_key_prefix=%s has_secret=%s', minio_endpoint, access_key[:4] + '...', bool(secret_key))
+
+    # Use S3v4 signing and path-style addressing which MinIO expects
+    s3_config = Config(signature_version='s3v4', s3={'addressing_style': 'path'})
     s3 = boto3.client(
         's3',
         endpoint_url=minio_endpoint,
-        aws_access_key_id=f"{minio_access_key_id}",
-        aws_secret_access_key=f"{minio_secret_access_key}",
-        config=Config(signature_version="s3v4"),
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        config=s3_config,
     )
 
     try:
@@ -262,10 +429,27 @@ def upload_to_minio(*, timeout: int = 60) -> str:
             log.info('Bucket %s already exists or cannot be created', minio_bucket)
             pass
 
+    object_url = f"{minio_endpoint.rstrip('/')}/{minio_bucket}/{key}"
     log.info('Uploading combined MP3 to bucket %s with key %s', minio_bucket, key)
     s3.put_object(Bucket=minio_bucket, Key=key, Body=final_bytes, ContentType='audio/mp3')
-    object_url = f"{minio_endpoint.rstrip('/')}/{minio_bucket}/{key}"
+
+   
     log.info('Uploaded combined MP3 to %s', object_url)
+
+    # Attempt to clean up the combined file and its temp directory
+    try:
+        if combined_path and os.path.exists(combined_path):
+            tmpdir = os.path.dirname(combined_path)
+            os.remove(combined_path)
+            # remove tmpdir if empty
+            try:
+                if not os.listdir(tmpdir):
+                    os.rmdir(tmpdir)
+            except Exception:
+                pass
+    except Exception:
+        log.warning('Failed to remove temporary combined file %s', combined_path)
+
     return object_url
 
 default_args = {
