@@ -144,36 +144,65 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
     chatterbox_url = Variable.get('chatterbox_url') or ''
     voice = voice or conf.get('voice') or 'default'
 
-    # chunking: prefer paragraph breaks or sentence endings (period) before max_chars
+    # chunking: split into sentences, then accumulate full sentences into chunks
     max_chars = int(conf.get('chunk_size', 3000))
     chunks = []
     text = generated_text.strip()
-    sentence_re = re.compile(r'[\.\!\?](?:\s|$)')
-    while text:
-        if len(text) <= max_chars:
-            chunks.append(text)
-            break
 
-        window = text[:max_chars]
+    # Find sentence-like units (naive regex: ends with . ! ? possibly followed by quote and whitespace)
+    sentence_re = re.compile(r'.+?(?:[\.\!\?]["\']?)(?:\s+|$)', re.S)
+    sentences = [m.group().strip() for m in sentence_re.finditer(text)]
+    # If regex misses trailing text without terminal punctuation, append remainder
+    consumed = sum(len(s) for s in sentences)
+    if consumed < len(text):
+        tail = text[consumed:].strip()
+        if tail:
+            sentences.append(tail)
 
-        # 1) prefer paragraph break (double newline)
-        para_idx = window.rfind('\n\n')
-        if para_idx > 0:
-            split_at = para_idx + 2
+    # Accumulate sentences into chunks without breaking sentences when possible
+    current = ''
+    for sent in sentences:
+        if not current:
+            # If single sentence is longer than max_chars, split it as a last resort
+            if len(sent) > max_chars:
+                remaining = sent
+                while remaining:
+                    if len(remaining) <= max_chars:
+                        current = remaining.strip()
+                        remaining = ''
+                    else:
+                        split_at = remaining.rfind(' ', 0, max_chars)
+                        if split_at <= 0:
+                            split_at = max_chars
+                        chunks.append(remaining[:split_at].strip())
+                        remaining = remaining[split_at:].strip()
+                continue
+            current = sent
+            continue
+
+        # Try to append sentence to current chunk
+        if len(current) + 1 + len(sent) <= max_chars:
+            current = current + ' ' + sent
         else:
-            # 2) prefer last sentence-ending punctuation within window
-            matches = list(sentence_re.finditer(window))
-            if matches:
-                split_at = matches[-1].end()
+            chunks.append(current.strip())
+            # Start new chunk with this sentence (may itself be very long and be split above)
+            if len(sent) > max_chars:
+                remaining = sent
+                while remaining:
+                    if len(remaining) <= max_chars:
+                        current = remaining.strip()
+                        remaining = ''
+                    else:
+                        split_at = remaining.rfind(' ', 0, max_chars)
+                        if split_at <= 0:
+                            split_at = max_chars
+                        chunks.append(remaining[:split_at].strip())
+                        remaining = remaining[split_at:].strip()
             else:
-                # 3) fallback to last space
-                split_at = window.rfind(' ')
-                if split_at <= 0:
-                    # 4) last resort: hard split at max_chars
-                    split_at = max_chars
+                current = sent
 
-        chunks.append(text[:split_at].strip())
-        text = text[split_at:].strip()
+    if current:
+        chunks.append(current.strip())
 
     if not chunks:
         raise ValueError('No text chunks to synthesize')
@@ -214,13 +243,14 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                         # Fall back to a generic progress endpoint
                         status_url = f"{chatterbox_url.rstrip('/')}/status/progress"
 
-                max_wait = int(conf.get('poll_max_wait', 300))
+                max_wait = int(conf.get('poll_max_wait', 600))
                 poll_interval = int(conf.get('poll_interval', 2))
                 elapsed = 0
                 final_resp = None
                 while elapsed < max_wait:
                     time.sleep(poll_interval)
                     elapsed += poll_interval
+                    log.info('Polling Chatterbox job status at %s (elapsed %ds)', status_url, elapsed)
                     s = requests.get(status_url, timeout=timeout)
                     if s.status_code == 200:
                         ct = s.headers.get('Content-Type', '')
