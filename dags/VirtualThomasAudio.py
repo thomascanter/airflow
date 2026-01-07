@@ -19,6 +19,45 @@ import time
 import re
 
 
+def _request_with_backoff(method: str, url: str, timeout: int, conf: dict, **kwargs):
+    """Perform HTTP request with simple exponential backoff retries for transient errors.
+
+    method: 'get' or 'post'
+    conf: DAG run conf used to read retry settings
+    """
+    # enforce a minimum timeout (in seconds) to avoid premature ReadTimeouts
+    if timeout is None or timeout < 1200:
+        timeout = 1200
+    max_retries = int(conf.get('chatterbox_max_retries', 3))
+    backoff = float(conf.get('chatterbox_backoff_factor', 2.0))
+    base_delay = float(conf.get('chatterbox_base_delay', 1.0))
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            if method.lower() == 'post':
+                return requests.post(url, timeout=timeout, **kwargs)
+            else:
+                return requests.get(url, timeout=timeout, **kwargs)
+        except requests.exceptions.ReadTimeout as exc:
+            if attempt == max_retries:
+                log.exception('ReadTimeout on %s %s (attempt %d/%d)', method, url, attempt, max_retries)
+                raise
+            sleep = base_delay * (backoff ** (attempt - 1))
+            log.warning('ReadTimeout on %s %s (attempt %d/%d), retrying in %.1fs', method, url, attempt, max_retries, sleep)
+            time.sleep(sleep)
+            continue
+        except requests.exceptions.RequestException as exc:
+            # Retry on connection-related errors as well
+            if attempt == max_retries:
+                log.exception('Request failed on %s %s (attempt %d/%d): %s', method, url, attempt, max_retries, exc)
+                raise
+            sleep = base_delay * (backoff ** (attempt - 1))
+            log.warning('RequestException on %s %s (attempt %d/%d): %s; retrying in %.1fs', method, url, attempt, max_retries, exc, sleep)
+            time.sleep(sleep)
+            continue
+
+
+
 def combine_audio_parts(parts: list, output_path: Optional[str] = None, bitrate: str = '192k') -> str:
     """Concatenate audio files in `parts` (in order) into a single MP3 using ffmpeg.
 
@@ -72,7 +111,7 @@ def _extract_text_from_conf() -> str:
     return text
 
 
-def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 600) -> str:
+def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 1200) -> str:
     context = get_current_context()
     text = _extract_text_from_conf()
     conf = (context.get('dag_run') or {}).conf or {}
@@ -90,7 +129,10 @@ def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 600
         ollama_url = f"{ollama_url.rstrip('/')}/api/generate"
         log.info('Sending generation request to Ollama at %s', ollama_url)
         log.info('Payload: %s', payload)
-        resp = requests.post(ollama_url, json=payload, timeout=timeout)
+        # enforce minimum timeout for potentially long generation
+        if timeout is None or timeout < 1200:
+            timeout = 1200
+        resp = _request_with_backoff('post', ollama_url, timeout, conf, json=payload)
         resp.raise_for_status()
     except requests.RequestException as exc:
         log.exception('Ollama request failed: %s', exc)
@@ -220,7 +262,7 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
 
         try:
             log.info('Requesting TTS from Chatterbox at %s', chatterbox_url)
-            resp = requests.post(f"{chatterbox_url.rstrip('/')}/audio/speech", json=payload, timeout=timeout)
+            resp = _request_with_backoff('post', f"{chatterbox_url.rstrip('/')}/audio/speech", timeout, conf, json=payload)
 
             # handle sync (200/201) or async accepted (202 -> poll)
             if resp.status_code in (200, 201):
@@ -242,7 +284,7 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                 elif isinstance(j, dict) and any(k in j for k in ('mp3_b64', 'audio_base64', 'audio_url')):
                     # If the JSON includes an audio URL, fetch it synchronously
                     if 'audio_url' in j and j.get('audio_url'):
-                        r2 = requests.get(j['audio_url'], timeout=timeout)
+                        r2 = _request_with_backoff('get', j['audio_url'], timeout, conf)
                         r2.raise_for_status()
                         final_resp = r2
                     else:
@@ -273,7 +315,7 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                 if isinstance(data, dict) and 'audio_base64' in data:
                     audio_bytes = base64.b64decode(data['audio_base64'])
                 elif isinstance(data, dict) and 'audio_url' in data:
-                    r2 = requests.get(data['audio_url'], timeout=timeout)
+                    r2 = _request_with_backoff('get', data['audio_url'], timeout, conf)
                     r2.raise_for_status()
                     audio_bytes = r2.content
                 else:
@@ -286,7 +328,7 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                     elif 'audio_base64' in data:
                         audio_bytes = base64.b64decode(data['audio_base64'])
                     elif 'audio_url' in data:
-                        r2 = requests.get(data['audio_url'], timeout=timeout)
+                        r2 = _request_with_backoff('get', data['audio_url'], timeout, conf)
                         r2.raise_for_status()
                         audio_bytes = r2.content
                     else:
