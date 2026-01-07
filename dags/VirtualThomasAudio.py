@@ -198,16 +198,21 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                 resp.raise_for_status()
                 final_resp = resp
             elif resp.status_code == 202:
-                # determine status URL from Location header or response JSON
+                # Chatterbox accepted the job; determine a status URL or construct one
                 status_url = resp.headers.get('Location')
                 try:
                     j = resp.json()
                 except Exception:
                     j = {}
+
+                job_id = j.get('job_id') or j.get('request_id')
                 if not status_url:
-                    status_url = j.get('status_url') or (f"{chatterbox_url.rstrip('/')}/audio/status/{j.get('job_id')}" if j.get('job_id') else None)
-                if not status_url:
-                    raise RuntimeError('Chatterbox accepted request but did not return a status URL')
+                    # Prefer the lightweight progress endpoint for polling
+                    if job_id:
+                        status_url = f"{chatterbox_url.rstrip('/')}/status/progress?request_id={job_id}"
+                    else:
+                        # Fall back to a generic progress endpoint
+                        status_url = f"{chatterbox_url.rstrip('/')}/status/progress"
 
                 max_wait = int(conf.get('poll_max_wait', 300))
                 poll_interval = int(conf.get('poll_interval', 2))
@@ -219,21 +224,41 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                     s = requests.get(status_url, timeout=timeout)
                     if s.status_code == 200:
                         ct = s.headers.get('Content-Type', '')
+                        # Some implementations may return audio directly
                         if ct.startswith('audio/'):
                             final_resp = s
                             break
+
+                        # Otherwise expect JSON with progress/status fields per docs
                         try:
                             sdata = s.json()
                         except Exception:
                             sdata = None
+
                         if sdata:
-                            if sdata.get('status') in ('completed', 'success') and any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')):
-                                final_resp = s
-                                break
+                            # If an error status reported, fail early
                             if sdata.get('status') in ('failed', 'error'):
                                 raise RuntimeError(f"Chatterbox job failed: {sdata}")
+
+                            # If processing finished, look for audio payload fields
+                            if not sdata.get('is_processing', True) and sdata.get('status') in ('completed', 'finalized'):
+                                if any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')):
+                                    final_resp = s
+                                    break
+                                # sometimes completed but audio served at a separate URL
+                                if 'audio_url' in sdata:
+                                    final_resp = s
+                                    break
+
+                            # If progress endpoint includes direct mp3 bytes or mp3_b64, accept it
+                            if any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')) and sdata.get('status') in ('completed',):
+                                final_resp = s
+                                break
+
+                        # If server returns 202 or still processing, continue polling
                         continue
                     elif s.status_code == 202:
+                        # still processing
                         continue
                     else:
                         s.raise_for_status()
