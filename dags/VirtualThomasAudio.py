@@ -125,7 +125,7 @@ def generate_with_ollama(*, ollama_url: Optional[str] = None, timeout: int = 600
     return str(data)
 
 
-def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[str] = None, timeout: int = 600) -> dict:
+def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[str] = None, timeout: int = 1200) -> dict:
     """Synthesize text in chunks and return base64-encoded MP3 bytes and filename.
 
     Returns a dict compatible with XCom JSON serialization: {'mp3_b64': str, 'filename': str}
@@ -227,74 +227,29 @@ def synthesize_chunks(*, chatterbox_url: Optional[str] = None, voice: Optional[s
                 resp.raise_for_status()
                 final_resp = resp
             elif resp.status_code == 202:
-                # Chatterbox accepted the job; determine a status URL or construct one
-                status_url = resp.headers.get('Location')
+                # Chatterbox accepted the job but returned 202. Polling has been removed
+                # due to timeout problems; try to extract immediate result (audio or audio_url)
                 try:
                     j = resp.json()
                 except Exception:
                     j = {}
 
-                job_id = j.get('job_id') or j.get('request_id')
-                if not status_url:
-                    # Prefer the lightweight progress endpoint for polling
-                    if job_id:
-                        status_url = f"{chatterbox_url.rstrip('/')}/status/progress?request_id={job_id}"
+                ct = resp.headers.get('Content-Type', '')
+                # If response already contains audio bytes, accept it
+                if ct.startswith('audio/'):
+                    final_resp = resp
+                # If response JSON includes audio or a URL to the audio, accept it
+                elif isinstance(j, dict) and any(k in j for k in ('mp3_b64', 'audio_base64', 'audio_url')):
+                    # If the JSON includes an audio URL, fetch it synchronously
+                    if 'audio_url' in j and j.get('audio_url'):
+                        r2 = requests.get(j['audio_url'], timeout=timeout)
+                        r2.raise_for_status()
+                        final_resp = r2
                     else:
-                        # Fall back to a generic progress endpoint
-                        status_url = f"{chatterbox_url.rstrip('/')}/status/progress"
-
-                max_wait = int(conf.get('poll_max_wait', 600))
-                poll_interval = int(conf.get('poll_interval', 2))
-                elapsed = 0
-                final_resp = None
-                while elapsed < max_wait:
-                    time.sleep(poll_interval)
-                    elapsed += poll_interval
-                    log.info('Polling Chatterbox job status at %s (elapsed %ds)', status_url, elapsed)
-                    s = requests.get(status_url, timeout=timeout)
-                    if s.status_code == 200:
-                        ct = s.headers.get('Content-Type', '')
-                        # Some implementations may return audio directly
-                        if ct.startswith('audio/'):
-                            final_resp = s
-                            break
-
-                        # Otherwise expect JSON with progress/status fields per docs
-                        try:
-                            sdata = s.json()
-                        except Exception:
-                            sdata = None
-
-                        if sdata:
-                            # If an error status reported, fail early
-                            if sdata.get('status') in ('failed', 'error'):
-                                raise RuntimeError(f"Chatterbox job failed: {sdata}")
-
-                            # If processing finished, look for audio payload fields
-                            if not sdata.get('is_processing', True) and sdata.get('status') in ('completed', 'finalized'):
-                                if any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')):
-                                    final_resp = s
-                                    break
-                                # sometimes completed but audio served at a separate URL
-                                if 'audio_url' in sdata:
-                                    final_resp = s
-                                    break
-
-                            # If progress endpoint includes direct mp3 bytes or mp3_b64, accept it
-                            if any(k in sdata for k in ('mp3_b64', 'audio_base64', 'audio_url')) and sdata.get('status') in ('completed',):
-                                final_resp = s
-                                break
-
-                        # If server returns 202 or still processing, continue polling
-                        continue
-                    elif s.status_code == 202:
-                        # still processing
-                        continue
-                    else:
-                        s.raise_for_status()
-
-                if final_resp is None:
-                    raise RuntimeError('Timed out waiting for Chatterbox job to complete')
+                        # keep original response; downstream parsing will extract base64 fields
+                        final_resp = resp
+                else:
+                    raise RuntimeError('Chatterbox accepted request but did not return immediate audio or audio_url; async polling disabled')
             else:
                 resp.raise_for_status()
                 final_resp = resp
